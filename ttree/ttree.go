@@ -20,6 +20,7 @@ package ttree
 import (
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 // Entry represents a key-value pair in the T-Tree.
@@ -45,6 +46,51 @@ type TTree struct {
 	minItems   int    // Minimum number of items in a node
 	maxItems   int    // Maximum number of items in a node
 	SizeOfTree uint64 // Size of the tree
+
+	// A tree is retired when it has been flushed and swapped out of active
+	// service. A retired tree is only kept alive while iterators or range
+	// queries still hold a reference (pin) on it.
+	retireMu sync.Mutex
+	retired  bool
+	refs     sync.WaitGroup
+}
+
+// Pin acquires a reference on the tree. It returns true when a reference was
+// acquired and false when the tree has already been reclaimed; in both cases
+// the caller must balance a successful Pin with a Release. While a reference is
+// held the backing nodes and entries remain valid.
+func (t *TTree) Pin() bool {
+	t.retireMu.Lock()
+	defer t.retireMu.Unlock()
+	if t.retired && t.root == nil {
+		return false
+	}
+	t.refs.Add(1)
+	return true
+}
+
+// Release drops a reference previously acquired with Pin. When the last
+// reference on a retired tree is released the tree is cleared so its backing
+// memory can be reclaimed.
+func (t *TTree) Release() {
+	t.refs.Done()
+}
+
+// Retire marks the tree as no longer serving new writes. It blocks until every
+// outstanding reference is released, then clears the tree so its backing memory
+// can be reclaimed. A query that captured this tree before the swap may still
+// Pin it concurrently; such a Pin keeps the tree alive until matched by a
+// Release.
+func (t *TTree) Retire() {
+	t.retireMu.Lock()
+	defer t.retireMu.Unlock()
+	t.retired = true
+	t.refs.Wait()
+
+	// Pin takes the same mutex, so no reference can be added while we are here.
+	// It is safe to drop the backing nodes once every reference is released.
+	t.root = nil
+	t.SizeOfTree = 0
 }
 
 // Iterator represents an iterator for the T-Tree.

@@ -19,6 +19,7 @@ package ttree
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -226,4 +227,74 @@ func BenchmarkTTree_Get(b *testing.B) {
 		key := []byte(fmt.Sprintf("key%d", i%1000))
 		tree.Get(key)
 	}
+}
+
+func TestTTree_PinKeepsTreeAliveAcrossRetire(t *testing.T) {
+	tree := New(12, 32)
+	for i := 0; i < 100; i++ {
+		if err := tree.Put([]byte(fmt.Sprintf("key%03d", i)), []byte(fmt.Sprintf("value%03d", i))); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	if !tree.Pin() {
+		t.Fatal("expected pin on a live tree to succeed")
+	}
+
+	retired := make(chan struct{})
+	go func() {
+		tree.Retire()
+		close(retired)
+	}()
+
+	// Retire must block while our pin is held, and the data must remain
+	// readable the whole time.
+	select {
+	case <-retired:
+		t.Fatal("Retire returned while a pin was still held")
+	default:
+	}
+
+	entry, ok := tree.Get([]byte("key042"))
+	if !ok || string(entry.Value) != "value042" {
+		t.Fatalf("pinned tree returned unexpected entry: %v %v", entry, ok)
+	}
+
+	tree.Release()
+	<-retired
+
+	if tree.Pin() {
+		t.Fatal("expected pin on a reclaimed tree to fail")
+	}
+	if _, ok := tree.Get([]byte("key042")); ok {
+		t.Fatal("expected reclaimed tree to be empty")
+	}
+}
+
+func TestTTree_ConcurrentPinsAndRetire(t *testing.T) {
+	tree := New(12, 32)
+	for i := 0; i < 500; i++ {
+		if err := tree.Put([]byte(fmt.Sprintf("key%03d", i)), []byte(fmt.Sprintf("value%03d", i))); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	const readers = 16
+	var wg sync.WaitGroup
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if tree.Pin() {
+				defer tree.Release()
+				if _, ok := tree.Get([]byte("key007")); !ok {
+					t.Error("key007 disappeared from a pinned tree")
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	tree.Retire()
 }

@@ -146,12 +146,31 @@ type VLogRecord struct {
 
 // Starskey represents the main struct for the package
 type Starskey struct {
-	wal      *pager.Pager // Write-ahead log
-	memtable *ttree.TTree // Memtable
-	levels   []*Level     // Disk levels
-	config   *Config      // Starskey configuration
-	lock     *sync.Mutex  // Mutex for thread safety
-	logFile  *os.File     // Debug log file
+	wal      *pager.Pager  // Write-ahead log
+	memtable *ttree.TTree  // Memtable
+	levels   []*Level      // Disk levels
+	config   *Config       // Starskey configuration
+	lock     *sync.RWMutex // Read/write lock guarding memtable swaps and levels
+	logFile  *os.File      // Debug log file
+}
+
+// pinMemtable captures a fixed reference to the current memtable. A range or
+// point query pins once up front and reads only that instance for the whole
+// query. If a flush swaps the memtable out halfway through, the pinned instance
+// stays valid until releaseMemtable is called instead of being reclaimed and
+// its memory returned to the pool while the query is still scanning it.
+//
+// Callers must hold skey.lock (read or write) and must pair every pin with
+// releaseMemtable, typically via defer.
+func (skey *Starskey) pinMemtable() *ttree.TTree {
+	memtable := skey.memtable
+	memtable.Pin()
+	return memtable
+}
+
+// releaseMemtable drops a reference acquired by pinMemtable.
+func (skey *Starskey) releaseMemtable(memtable *ttree.TTree) {
+	memtable.Release()
 }
 
 // Txn represents a transaction
@@ -370,7 +389,7 @@ func Open(config *Config) (*Starskey, error) {
 
 	skey.WriteLog("Levels opened successfully")
 
-	skey.lock = &sync.Mutex{}
+	skey.lock = &sync.RWMutex{}
 
 	skey.WriteLog("Replaying WAL")
 
@@ -590,12 +609,18 @@ func (skey *Starskey) Get(key []byte) ([]byte, error) {
 		return nil, errors.New("key cannot be empty")
 	}
 
-	// Lock for thread safety
-	skey.lock.Lock()
-	defer skey.lock.Unlock()
+	// Lock for thread safety. Reads take a read lock so concurrent queries do
+	// not serialize against each other; only writes and flushes take the write
+	// lock.
+	skey.lock.RLock()
+	defer skey.lock.RUnlock()
+
+	// Pin the memtable so a flush cannot reclaim the instance under us.
+	memtable := skey.pinMemtable()
+	defer skey.releaseMemtable(memtable)
 
 	// Check memtable first
-	if value, exists := skey.memtable.Get(key); exists {
+	if value, exists := memtable.Get(key); exists {
 		// Check for tombstone
 		if bytes.Equal(value.Value, Tombstone) {
 			return nil, nil
@@ -691,16 +716,24 @@ func (skey *Starskey) Range(startKey, endKey []byte) ([][]byte, error) {
 		return nil, errors.New("start key cannot be greater than end key")
 	}
 
-	// Lock for thread safety
-	skey.lock.Lock()
-	defer skey.lock.Unlock()
+	// Lock for thread safety. The read lock lets multiple ranges run at once
+	// while still blocking a flush from swapping the memtable during pin.
+	skey.lock.RLock()
+	defer skey.lock.RUnlock()
 
 	// We create a slice to store the values
 	var result [][]byte
 	seenKeys := make(map[string]struct{}) // We use a map to keep track of seen keys
 
+	// Pin one fixed memtable for the whole range. If a flush happens while we
+	// are scanning the disk levels this instance stays alive; without the pin
+	// its nodes could be reclaimed and their memory reused while the iterator
+	// is still walking them, yielding garbled entries.
+	memtable := skey.pinMemtable()
+	defer skey.releaseMemtable(memtable)
+
 	// Check memtable first
-	entries := skey.memtable.Range(startKey, endKey)
+	entries := memtable.Range(startKey, endKey)
 	for _, entry := range entries {
 		result = append(result, entry.Value)
 		seenKeys[string(entry.Key)] = struct{}{}
@@ -769,15 +802,18 @@ func (skey *Starskey) FilterKeys(compare func(key []byte) bool) ([][]byte, error
 	}
 
 	// Lock for thread safety
-	skey.lock.Lock()
-	defer skey.lock.Unlock()
+	skey.lock.RLock()
+	defer skey.lock.RUnlock()
 
 	var result [][]byte
 	seenKeys := make(map[string]struct{})
 
 	// Check memtable first
-
-	iter := skey.memtable.NewIterator(false)
+	// Pin the memtable so a concurrent flush cannot reclaim it under the
+	// iterator; the read lock lets this run alongside other queries.
+	memtable := skey.pinMemtable()
+	defer skey.releaseMemtable(memtable)
+	iter := memtable.NewIterator(false)
 	for iter.Valid() {
 		if entry, ok := iter.Current(); ok {
 			if compare(entry.Key) {
@@ -901,16 +937,18 @@ func (txn *Txn) Delete(key []byte) {
 	txn.lock.Lock()
 	defer txn.lock.Unlock()
 
-	currentValue, exists := txn.db.memtable.Get(key)
-	if exists {
+	// Go through the locked read path. Touching db.memtable directly here would
+	// race with a flush swapping the memtable while no db lock is held.
+	currentValue, err := txn.db.Get(key)
+	if err == nil && currentValue != nil {
 		txn.operations = append(txn.operations, &TxnOperation{
 			key:      key,
-			value:    currentValue.Value,
+			value:    currentValue,
 			op:       Delete,
 			commited: false,
 			rollback: &TxnRollbackOperation{
 				key:   key,
-				value: currentValue.Value,
+				value: currentValue,
 				op:    Put,
 			},
 		})
@@ -1227,6 +1265,14 @@ func (skey *Starskey) replayWAL() error {
 // run runs a sorted flush to disk level 1
 func (skey *Starskey) run() error {
 	skey.WriteLog("Running sorted run to l1")
+
+	// Fix the memtable being flushed into a local variable. Everything below
+	// reads this instance instead of dereferencing skey.memtable repeatedly, so
+	// a swap performed later in this call cannot change what we flush. run()
+	// holds the write lock for its whole duration, so no other path can swap
+	// the memtable underneath us.
+	flushing := skey.memtable
+
 	// Create a new SSTable
 	sstable := &SSTable{
 		klog: nil,
@@ -1262,13 +1308,13 @@ func (skey *Starskey) run() error {
 			return err
 		}
 		// We get a count of entries in the memtable
-		mtCount := uint(skey.memtable.CountEntries())
+		mtCount := uint(flushing.CountEntries())
 
 		skey.WriteLog(fmt.Sprintf("Creating SuRF for run with %d entries", mtCount))
 
 		srf := surf.New(int(mtCount))
 
-		iter := skey.memtable.NewIterator(false)
+		iter := flushing.NewIterator(false)
 		for iter.Valid() {
 			if entry, ok := iter.Current(); ok {
 				srf.Add(entry.Key)
@@ -1322,7 +1368,7 @@ func (skey *Starskey) run() error {
 			return err
 		}
 		// We get a count of entries in the memtable
-		mtCount := uint(skey.memtable.CountEntries())
+		mtCount := uint(flushing.CountEntries())
 
 		skey.WriteLog(fmt.Sprintf("Creating bloom filter for run with %d entries", mtCount))
 
@@ -1331,7 +1377,7 @@ func (skey *Starskey) run() error {
 			return err
 		}
 
-		iter := skey.memtable.NewIterator(false)
+		iter := flushing.NewIterator(false)
 		for iter.Valid() {
 			if entry, ok := iter.Current(); ok {
 				bf.Add(entry.Key)
@@ -1374,7 +1420,7 @@ func (skey *Starskey) run() error {
 
 	}
 
-	iter := skey.memtable.NewIterator(false)
+	iter := flushing.NewIterator(false)
 	for iter.Valid() {
 		if entry, ok := iter.Current(); ok {
 			// We create the vlog record first and get the page
@@ -1449,8 +1495,14 @@ func (skey *Starskey) run() error {
 	sstable.klog = klog
 	sstable.vlog = vlog
 
-	// Clear the memtable
+	// Swap in a fresh memtable and retire the flushed one. Retire blocks until
+	// every query still scanning the old tree releases its pin, so its nodes
+	// and entry byte slices cannot be reclaimed (and later reused) under a live
+	// iterator. run() holds the write lock, which prevents new queries from
+	// pinning the new memtable through skey.memtable during the swap.
+	oldMemtable := skey.memtable
 	skey.memtable = ttree.New(TTreeMin, TTreeMax)
+	oldMemtable.Retire()
 
 	skey.WriteLog("Memtable cleared")
 
@@ -1476,7 +1528,7 @@ func (skey *Starskey) run() error {
 	// Check if compaction is needed
 	if skey.levels[0].shouldCompact() {
 		// We start from l1
-		if err := skey.compact(0); err != nil {
+		if err := skey.compactLocked(0); err != nil {
 			return err
 		}
 	}
@@ -1487,6 +1539,17 @@ func (skey *Starskey) run() error {
 // compact compacts level(s) recursively
 // only if the level is full based on the max size
 func (skey *Starskey) compact(level int) error {
+	// Compaction rewrites level slices and SSTables. Take the write lock so
+	// readers holding a read lock cannot observe a level being mutated or an
+	// SSTable whose files are being replaced. The recursive compaction steps
+	// run in compactLocked which assumes the lock is already held.
+	skey.lock.Lock()
+	defer skey.lock.Unlock()
+	return skey.compactLocked(level)
+}
+
+// compactLocked performs compaction with skey.lock already held for writing.
+func (skey *Starskey) compactLocked(level int) error {
 	skey.WriteLog(fmt.Sprintf("Compacting level %d", level+1))
 	// Ensure we do not go beyond the last level
 	if level >= len(skey.levels)-1 {
@@ -1556,7 +1619,7 @@ func (skey *Starskey) compact(level int) error {
 
 	// Recursively check next level
 	if nextLevel.shouldCompact() {
-		return skey.compact(level + 1)
+		return skey.compactLocked(level + 1)
 
 	}
 
@@ -2136,8 +2199,14 @@ func (skey *Starskey) DeleteByRange(startKey, endKey []byte) (int, error) {
 	seenKeys := make(map[string]struct{})
 	deletedCount := 0
 
+	// Fix the memtable in a local variable. This path holds the write lock and
+	// triggers run() inline, so it must not pin: a pin here would deadlock
+	// against run()'s Retire. The write lock itself prevents any swap other
+	// than our own run() call, which only happens after scanning finishes.
+	memtable := skey.memtable
+
 	// Check memtable first
-	entries := skey.memtable.Range(startKey, endKey)
+	entries := memtable.Range(startKey, endKey)
 	for _, entry := range entries {
 		// Skip if we've already seen this key
 		if _, seen := seenKeys[string(entry.Key)]; seen {
@@ -2164,7 +2233,7 @@ func (skey *Starskey) DeleteByRange(startKey, endKey []byte) (int, error) {
 		}
 
 		// Add tombstone to memtable
-		err = skey.memtable.Put(entry.Key, Tombstone)
+		err = memtable.Put(entry.Key, Tombstone)
 		if err != nil {
 			return deletedCount, err
 		}
@@ -2244,7 +2313,7 @@ func (skey *Starskey) DeleteByRange(startKey, endKey []byte) (int, error) {
 					}
 
 					// Add tombstone to memtable
-					err = skey.memtable.Put(klogRecord.Key, Tombstone)
+					err = memtable.Put(klogRecord.Key, Tombstone)
 					if err != nil {
 						return deletedCount, err
 					}
@@ -2262,7 +2331,7 @@ func (skey *Starskey) DeleteByRange(startKey, endKey []byte) (int, error) {
 	}
 
 	// Check if compaction is needed
-	if deletedCount > 0 && skey.memtable.SizeOfTree >= skey.config.FlushThreshold {
+	if deletedCount > 0 && memtable.SizeOfTree >= skey.config.FlushThreshold {
 		if err := skey.run(); err != nil {
 			return deletedCount, err
 		}
@@ -2287,7 +2356,11 @@ func (skey *Starskey) DeleteByFilter(compare func(key []byte) bool) (int, error)
 	deletedCount := 0
 
 	// Check memtable first
-	iter := skey.memtable.NewIterator(false)
+	// This path holds the write lock and flushes inline, so pinning would
+	// deadlock against run()'s Retire; the write lock already stabilizes the
+	// memtable for the whole operation.
+	memtable := skey.memtable
+	iter := memtable.NewIterator(false)
 	for iter.Valid() {
 		if entry, ok := iter.Current(); ok {
 			// Skip if we've already seen this key
@@ -2324,7 +2397,7 @@ func (skey *Starskey) DeleteByFilter(compare func(key []byte) bool) (int, error)
 				}
 
 				// Add tombstone to memtable
-				err = skey.memtable.Put(entry.Key, Tombstone)
+				err = memtable.Put(entry.Key, Tombstone)
 				if err != nil {
 					return deletedCount, err
 				}
@@ -2405,7 +2478,7 @@ func (skey *Starskey) DeleteByFilter(compare func(key []byte) bool) (int, error)
 					}
 
 					// Add tombstone to memtable
-					err = skey.memtable.Put(klogRecord.Key, Tombstone)
+					err = memtable.Put(klogRecord.Key, Tombstone)
 					if err != nil {
 						return deletedCount, err
 					}
@@ -2423,7 +2496,7 @@ func (skey *Starskey) DeleteByFilter(compare func(key []byte) bool) (int, error)
 	}
 
 	// Check if compaction is needed
-	if deletedCount > 0 && skey.memtable.SizeOfTree >= skey.config.FlushThreshold {
+	if deletedCount > 0 && memtable.SizeOfTree >= skey.config.FlushThreshold {
 		if err := skey.run(); err != nil {
 			return deletedCount, err
 		}
@@ -2441,15 +2514,19 @@ func (skey *Starskey) LongestPrefixSearch(key []byte) ([]byte, int, error) {
 	}
 
 	// Lock for thread safety
-	skey.lock.Lock()
-	defer skey.lock.Unlock()
+	skey.lock.RLock()
+	defer skey.lock.RUnlock()
 
 	var bestMatch []byte
 	var bestMatchLength int = -1
 	seenKeys := make(map[string]struct{}) // Track seen keys like in Range method
 
+	// Pin the memtable scanned below so a concurrent flush cannot reclaim it.
+	memtable := skey.pinMemtable()
+	defer skey.releaseMemtable(memtable)
+
 	// We check memtable first
-	entries := skey.memtable.Range([]byte{}, key) // Get all entries up to our search key
+	entries := memtable.Range([]byte{}, key) // Get all entries up to our search key
 	for _, entry := range entries {
 		// We skip if we've seen this key before
 		if _, seen := seenKeys[string(entry.Key)]; seen {
@@ -2593,7 +2670,12 @@ func (skey *Starskey) DeleteByPrefix(prefix []byte) (int, error) {
 	deletedCount := 0
 
 	// Check memtable first
-	iter := skey.memtable.NewIterator(false)
+	// This path holds the write lock and flushes inline, so pinning would
+	// deadlock against run()'s Retire; the write lock already stabilizes the
+	// memtable for the whole operation.
+	memtable := skey.memtable
+
+	iter := memtable.NewIterator(false)
 	for iter.Valid() {
 		if entry, ok := iter.Current(); ok {
 			// Skip if we've already seen this key
@@ -2630,7 +2712,7 @@ func (skey *Starskey) DeleteByPrefix(prefix []byte) (int, error) {
 				}
 
 				// Add tombstone to memtable
-				err = skey.memtable.Put(entry.Key, Tombstone)
+				err = memtable.Put(entry.Key, Tombstone)
 				if err != nil {
 					return 0, err
 				}
@@ -2718,7 +2800,7 @@ func (skey *Starskey) DeleteByPrefix(prefix []byte) (int, error) {
 					}
 
 					// Add tombstone to memtable
-					err = skey.memtable.Put(klogRecord.Key, Tombstone)
+					err = memtable.Put(klogRecord.Key, Tombstone)
 					if err != nil {
 						return 0, err
 					}
@@ -2736,7 +2818,7 @@ func (skey *Starskey) DeleteByPrefix(prefix []byte) (int, error) {
 	}
 
 	// Check if compaction is needed
-	if deletedCount > 0 && skey.memtable.SizeOfTree >= skey.config.FlushThreshold {
+	if deletedCount > 0 && memtable.SizeOfTree >= skey.config.FlushThreshold {
 		if err := skey.run(); err != nil {
 			return 0, err
 		}
@@ -2753,14 +2835,17 @@ func (skey *Starskey) PrefixSearch(prefix []byte) ([][]byte, error) {
 	}
 
 	// Lock for thread safety
-	skey.lock.Lock()
-	defer skey.lock.Unlock()
+	skey.lock.RLock()
+	defer skey.lock.RUnlock()
 
 	var result [][]byte
 	seenKeys := make(map[string]struct{})
 
 	// Check memtable first
-	entries := skey.memtable.Range(prefix, append(prefix, 0xFF))
+	memtable := skey.pinMemtable()
+	defer skey.releaseMemtable(memtable)
+
+	entries := memtable.Range(prefix, append(prefix, 0xFF))
 	for _, entry := range entries {
 		// Check if key has the prefix
 		if bytes.HasPrefix(entry.Key, prefix) {

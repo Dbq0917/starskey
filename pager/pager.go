@@ -42,6 +42,22 @@ type Pager struct {
 	syncInterval time.Duration   // File sync interval
 	sync         bool            // To sync or not to sync
 	closed       atomic.Bool     // We use to track if we have closed the pager already to prevent double closing
+	writeMu      sync.Mutex      // Serializes writes, which rely on a shared seek-to-end offset
+}
+
+// readAtFull reads exactly len(buf) bytes at the given absolute offset. Unlike
+// Seek followed by Read it does not touch the file's shared offset, so multiple
+// readers can safely page through the same file concurrently.
+func (p *Pager) readAtFull(buf []byte, offset int64) error {
+	for len(buf) > 0 {
+		n, err := p.file.ReadAt(buf, offset)
+		if err != nil {
+			return err
+		}
+		buf = buf[n:]
+		offset += int64(n)
+	}
+	return nil
 }
 
 // Iterator is the iterator struct used for
@@ -200,6 +216,11 @@ func (p *Pager) GetPageSize() int {
 
 // writePage writes a page to the file
 func (p *Pager) writePage(data []byte, overflow bool) (int, error) {
+	// Reserve the page number and append the page atomically. Two writers
+	// racing on seek-to-end would otherwise claim the same page number.
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	pageNumber := p.newPageNumber()
 
 	// Create a buffer to hold the header and the data, ensuring it is the size of a page
@@ -234,6 +255,8 @@ func (p *Pager) writePage(data []byte, overflow bool) (int, error) {
 
 // newPageNumber returns the next page number
 func (p *Pager) newPageNumber() int64 {
+	// Callers must hold writeMu so the size check and the following
+	// seek-to-end write reserve the page atomically.
 	// Get the file size
 	fileInfo, err := p.file.Stat()
 	if err != nil {
@@ -246,28 +269,26 @@ func (p *Pager) newPageNumber() int64 {
 func (p *Pager) Read(pg int) ([]byte, int, error) {
 	var data []byte
 
+	header := make([]byte, 16)
 	for {
-		// Seek to the start of the page
 		offset := int64(pg) * int64(p.pageSize+16)
-		_, err := p.file.Seek(offset, 0)
-		if err != nil {
-			return nil, -1, err
-		}
 
-		// Read the header
-		header := make([]byte, 16)
-		_, err = p.file.Read(header)
+		// Read the header at an absolute offset so concurrent readers do not
+		// race on the file's shared seek offset.
+		err := p.readAtFull(header, offset)
 		if err != nil {
 			return nil, -1, err
 		}
 
 		// Get the size of the data
 		dataSize := binary.LittleEndian.Uint64(header[0:8])
+		if dataSize > uint64(p.pageSize) {
+			return nil, -1, fmt.Errorf("invalid page size %d at page %d", dataSize, pg)
+		}
 
 		// Read the data
 		pageData := make([]byte, dataSize)
-		_, err = p.file.Read(pageData)
-		if err != nil {
+		if err := p.readAtFull(pageData, offset+16); err != nil {
 			return nil, -1, err
 		}
 

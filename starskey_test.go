@@ -1091,6 +1091,94 @@ func TestStarskey_Range(t *testing.T) {
 	}
 }
 
+func TestStarskey_Range_ConcurrentWriteAndFlush(t *testing.T) {
+	_ = os.RemoveAll("test")
+	defer func() {
+		_ = os.RemoveAll("test")
+	}()
+
+	// A small flush threshold forces frequent memtable swaps while readers are
+	// mid-scan, which is the exact interleaving that used to free a memtable
+	// under a live range iterator.
+	config := &Config{
+		Permission:     0755,
+		Directory:      "test",
+		FlushThreshold: 256,
+		MaxLevel:       3,
+		SizeFactor:     10,
+		BloomFilter:    false,
+		Logging:        false,
+	}
+
+	db, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	const writers = 4
+	const writesPerGoroutine = 500
+
+	var writerWg sync.WaitGroup
+	var readerWg sync.WaitGroup
+
+	// Writers keep inserting, triggering flushes all along the way.
+	for w := 0; w < writers; w++ {
+		writerWg.Add(1)
+		go func(w int) {
+			defer writerWg.Done()
+			for i := 0; i < writesPerGoroutine; i++ {
+				key := []byte(fmt.Sprintf("key-%02d-%05d", w, i))
+				value := []byte(fmt.Sprintf("value-%02d-%05d", w, i))
+				if err := db.Put(key, value); err != nil {
+					t.Errorf("put failed: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Readers continuously range over the key space while the memtable is being
+	// swapped out. Every returned value must match a value that was actually
+	// written; garbled bytes from reclaimed memory would fail this check.
+	stop := make(chan struct{})
+	for r := 0; r < 4; r++ {
+		readerWg.Add(1)
+		go func() {
+			defer readerWg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				results, err := db.Range([]byte("key-00-00000"), []byte("key-03-99999"))
+				if err != nil {
+					t.Errorf("range failed: %v", err)
+					return
+				}
+
+				for _, value := range results {
+					if !bytes.HasPrefix(value, []byte("value-")) {
+						t.Errorf("range returned corrupted value: %q", value)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Readers run while every write and flush is happening; once all writes
+	// have completed (and their memtables have been retired) stop the readers.
+	writerWg.Wait()
+	close(stop)
+	readerWg.Wait()
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+}
+
 func TestStarskey_Range_Invalid(t *testing.T) {
 	_ = os.RemoveAll("test")
 	defer func() {
