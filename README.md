@@ -97,6 +97,22 @@ func main() {
 
 ```
 
+## Online Backups
+`Backup` creates a point-in-time copy without closing the database. Starskey takes its write lock only long enough to copy the current WAL and establish hard links to immutable SSTables. The actual file copy happens after the lock is released, so routine writes can continue while the backup is being materialized.
+
+```go
+if err := skey.Backup("weekly_backup"); err != nil {
+    // ..handle error
+}
+
+// Copy the backup into a restore location, then Open it with the same options.
+if err := starskey.RestoreBackup("weekly_backup", "restored_db"); err != nil {
+    // ..handle error
+}
+```
+
+The backup directory is also a valid Starskey directory and can be opened directly by setting `Config.Directory` to the backup path.
+
 ## Range Keys
 You can provide a start and end key to retrieve a range of keys values.
 ```go

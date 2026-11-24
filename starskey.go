@@ -388,6 +388,8 @@ func Open(config *Config) (*Starskey, error) {
 
 // Close closes the Starskey instance
 func (skey *Starskey) Close() error {
+	skey.lock.Lock()
+	defer skey.lock.Unlock()
 
 	skey.WriteLog("Closing WAL")
 
