@@ -138,6 +138,65 @@ func (t *TTree) Put(key, value []byte) error {
 	return nil
 }
 
+// PutBatch inserts a group of entries atomically. Either every entry is
+// inserted or the tree is left unchanged.
+func (t *TTree) PutBatch(entries []*Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	clone := t.clone()
+	for _, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("entry is nil")
+		}
+		if err := clone.Put(entry.Key, entry.Value); err != nil {
+			return err
+		}
+	}
+
+	*t = *clone
+	return nil
+}
+
+// clone returns a deep copy of the tree's nodes. Entry keys and values are
+// immutable for the lifetime of an insertion and can be shared.
+func (t *TTree) clone() *TTree {
+	clone := &TTree{
+		minItems:   t.minItems,
+		maxItems:   t.maxItems,
+		SizeOfTree: t.SizeOfTree,
+	}
+	clone.root = cloneNode(t.root, nil)
+	return clone
+}
+
+func cloneNode(node *Node, parent *Node) *Node {
+	if node == nil {
+		return nil
+	}
+
+	clone := &Node{
+		parent:   parent,
+		data:     make([]*Entry, len(node.data)),
+		height:   node.height,
+		minItems: node.minItems,
+		maxItems: node.maxItems,
+	}
+
+	for i, entry := range node.data {
+		clone.data[i] = &Entry{
+			Key:   entry.Key,
+			Value: entry.Value,
+		}
+	}
+
+	clone.left = cloneNode(node.left, clone)
+	clone.right = cloneNode(node.right, clone)
+
+	return clone
+}
+
 // findBoundingNode finds the node that bounds the specified key.
 func (t *TTree) findBoundingNode(key []byte) *Node {
 	current := t.root

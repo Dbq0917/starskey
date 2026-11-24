@@ -120,9 +120,11 @@ const (
 
 // WALRecord represents a WAL record
 type WALRecord struct {
-	Key   []byte        // Key
-	Value []byte        // Value
-	Op    OperationType // Operation type
+	Key       []byte        // Key
+	Value     []byte        // Value
+	Op        OperationType // Operation type
+	TxnID     uint64        // Transaction id, zero for a standalone record
+	TxnCommit bool          // Marks the end of a transaction in the WAL
 }
 
 // SSTable represents a sorted string table
@@ -152,6 +154,7 @@ type Starskey struct {
 	config   *Config      // Starskey configuration
 	lock     *sync.Mutex  // Mutex for thread safety
 	logFile  *os.File     // Debug log file
+	txnSeq   uint64       // Last transaction id written to the WAL
 }
 
 // Txn represents a transaction
@@ -465,6 +468,14 @@ func (skey *Starskey) appendToWal(record *WALRecord) error {
 	}
 
 	return nil
+}
+
+// truncateWal removes everything written after size and makes the truncation
+// durable.
+func (skey *Starskey) truncateWal(size int64) {
+	if err := skey.wal.TruncateTo(size); err == nil {
+		skey.wal.EscalateFSync()
+	}
 }
 
 // Put puts a key-value pair into the database
@@ -933,58 +944,92 @@ func (txn *Txn) Commit() error {
 	txn.lock.Lock()
 	defer txn.lock.Unlock()
 
+	// Build the complete transaction before touching either the WAL or the
+	// memtable. This lets us keep the commit boundary atomic.
+	txnID := txn.db.txnSeq + 1
+	records := make([]*WALRecord, 0, len(txn.operations))
+	entries := make([]*ttree.Entry, 0, len(txn.operations))
+
 	for _, op := range txn.operations {
-		var record *WALRecord
 		switch op.op {
 		case Put:
-			// Create a WAL record
-			record = &WALRecord{
+			records = append(records, &WALRecord{
 				Key:   op.key,
 				Value: op.value,
 				Op:    Put,
-			}
-
+				TxnID: txnID,
+			})
+			entries = append(entries, &ttree.Entry{
+				Key:   op.key,
+				Value: op.value,
+			})
 		case Delete:
-			record = &WALRecord{
+			records = append(records, &WALRecord{
 				Key:   op.key,
 				Value: op.value,
 				Op:    Delete,
-			}
+				TxnID: txnID,
+			})
+			entries = append(entries, &ttree.Entry{
+				Key:   op.key,
+				Value: op.value,
+			})
 		case Get:
 			continue
+		default:
+			return fmt.Errorf("unsupported transaction operation: %d", op.op)
 		}
+	}
 
-		// Append to WAL
-		err := txn.db.appendToWal(record)
-		if err != nil {
-			_ = txn.Rollback()
+	if len(records) == 0 {
+		return nil
+	}
+
+	txn.db.txnSeq = txnID
+	walStart := txn.db.wal.Size()
+
+	// Write the whole transaction to the WAL without syncing after each
+	// record. The commit marker following the records makes the group
+	// recoverable as a single unit.
+	for _, record := range records {
+		if err := txn.db.appendToWal(record); err != nil {
+			txn.db.truncateWal(walStart)
 			return err
 		}
+	}
 
-		// Escalate write
-		txn.db.wal.EscalateFSync()
+	if err := txn.db.appendToWal(&WALRecord{
+		TxnID:     txnID,
+		TxnCommit: true,
+	}); err != nil {
+		txn.db.truncateWal(walStart)
+		return err
+	}
 
-		// Put the key-value pair into the memtable
-		err = txn.db.memtable.Put(op.key, op.value)
-		if err != nil {
-			_ = txn.Rollback()
-			return err
+	// Apply the transaction to the memtable atomically. If any operation
+	// fails, the memtable is left exactly as it was before the commit.
+	if err := txn.db.memtable.PutBatch(entries); err != nil {
+		txn.db.truncateWal(walStart)
+		return err
+	}
+
+	// One sync covers every record in the transaction.
+	txn.db.wal.EscalateFSync()
+
+	for _, op := range txn.operations {
+		if op.op != Get {
+			op.commited = true
 		}
-
-		op.commited = true
-
 	}
 
 	if txn.db.memtable.SizeOfTree >= txn.db.config.FlushThreshold {
 		// Sorted run to level 1
 		if err := txn.db.run(); err != nil {
-			_ = txn.Rollback()
 			return err
 		}
 	}
 
 	return nil
-
 }
 
 // Update runs a function within a transaction.
@@ -1192,6 +1237,39 @@ func (skey *Starskey) replayWAL() error {
 	// We create an iter for the write-ahead log
 	iter := pager.NewIterator(skey.wal)
 
+	var pendingID uint64
+	var pending []*WALRecord
+
+	applyRecord := func(record *WALRecord) error {
+		switch record.Op {
+		case Put:
+			return skey.memtable.Put(record.Key, record.Value)
+		case Delete:
+			return skey.memtable.Put(record.Key, Tombstone)
+		}
+		return nil
+	}
+
+	applyBatch := func(records []*WALRecord) error {
+		entries := make([]*ttree.Entry, 0, len(records))
+		for _, record := range records {
+			switch record.Op {
+			case Put:
+				entries = append(entries, &ttree.Entry{
+					Key:   record.Key,
+					Value: record.Value,
+				})
+			case Delete:
+				entries = append(entries, &ttree.Entry{
+					Key:   record.Key,
+					Value: Tombstone,
+				})
+			}
+		}
+
+		return skey.memtable.PutBatch(entries)
+	}
+
 	// We iterate over all records in the write-ahead log
 	for iter.Next() {
 		data, err := iter.Read()
@@ -1205,18 +1283,38 @@ func (skey *Starskey) replayWAL() error {
 			return err
 		}
 
-		// We apply the operation in the WAL record
-		switch record.Op {
-		case Put:
-			err = skey.memtable.Put(record.Key, record.Value)
-			if err != nil {
-				return err
+		if record.TxnID > skey.txnSeq {
+			skey.txnSeq = record.TxnID
+		}
+
+		// Transaction records are buffered until their commit marker is
+		// encountered. A transaction without a marker was not committed and
+		// is discarded.
+		if record.TxnID != 0 {
+			if record.TxnCommit {
+				if record.TxnID == pendingID {
+					if err := applyBatch(pending); err != nil {
+						return err
+					}
+				}
+				pending = nil
+				pendingID = 0
+				continue
 			}
-		case Delete:
-			err = skey.memtable.Put(record.Key, Tombstone)
-			if err != nil {
-				return err
+
+			if record.TxnID != pendingID {
+				pending = nil
+				pendingID = record.TxnID
 			}
+			pending = append(pending, record)
+			continue
+		}
+
+		// Standalone records are applied immediately.
+		pending = nil
+		pendingID = 0
+		if err := applyRecord(record); err != nil {
+			return err
 		}
 
 	}

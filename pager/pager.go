@@ -106,6 +106,20 @@ func (p *Pager) Truncate() error {
 	return nil
 }
 
+// TruncateTo truncates the file to the given size.
+func (p *Pager) TruncateTo(size int64) error {
+	if size < 0 {
+		return errors.New("size cannot be negative")
+	}
+
+	if err := p.file.Truncate(size); err != nil {
+		return err
+	}
+
+	_, err := p.file.Seek(size, 0)
+	return err
+}
+
 // Size returns the size of the file
 func (p *Pager) Size() int64 {
 	fileInfo, err := p.file.Stat()

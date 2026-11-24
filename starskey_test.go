@@ -661,6 +661,149 @@ func TestStarskey_Update(t *testing.T) {
 	}
 }
 
+func TestStarskey_TxnCommitAtomicOnMemtableFailure(t *testing.T) {
+	directory := "test-txn-atomic"
+	_ = os.RemoveAll(directory)
+	defer func() {
+		_ = os.RemoveAll(directory)
+	}()
+
+	// A one-entry node makes the fifth operation (an update of the first
+	// key) fail in the memtable.
+	oldTTreeMin, oldTTreeMax := TTreeMin, TTreeMax
+	TTreeMin, TTreeMax = 1, 1
+	defer func() {
+		TTreeMin, TTreeMax = oldTTreeMin, oldTTreeMax
+	}()
+
+	config := &Config{
+		Permission:     0755,
+		Directory:      directory,
+		FlushThreshold: 1024 * 1024,
+		MaxLevel:       3,
+		SizeFactor:     10,
+		BloomFilter:    false,
+		Logging:        false,
+	}
+
+	starskey, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	txn := starskey.BeginTxn()
+	keys := [][]byte{
+		[]byte("key1"),
+		[]byte("key2"),
+		[]byte("key3"),
+		[]byte("key4"),
+	}
+	for _, key := range keys {
+		txn.Put(key, append([]byte("value-"), key...))
+	}
+	txn.Put([]byte("key1"), []byte("updated"))
+
+	if err := txn.Commit(); err == nil {
+		t.Fatalf("Expected commit to fail on the fifth operation")
+	}
+
+	if count := starskey.memtable.CountEntries(); count != 0 {
+		t.Fatalf("Expected no transaction entries in memory, got %d", count)
+	}
+
+	for _, key := range keys {
+		value, err := starskey.Get(key)
+		if err != nil {
+			t.Fatalf("Failed to get key %s: %v", key, err)
+		}
+		if value != nil {
+			t.Fatalf("Expected key %s to be absent, got %s", key, value)
+		}
+	}
+
+	if pages := starskey.wal.PageCount(); pages != 0 {
+		t.Fatalf("Expected the failed transaction to be removed from the WAL, got %d pages", pages)
+	}
+
+	if err := starskey.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+
+	starskey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to reopen starskey: %v", err)
+	}
+	defer func() {
+		_ = starskey.Close()
+	}()
+
+	for _, key := range keys {
+		value, err := starskey.Get(key)
+		if err != nil {
+			t.Fatalf("Failed to get key %s after reopen: %v", key, err)
+		}
+		if value != nil {
+			t.Fatalf("Expected key %s to be absent after reopen, got %s", key, value)
+		}
+	}
+}
+
+func TestStarskey_TxnCommitReopen(t *testing.T) {
+	directory := "test-txn-reopen"
+	_ = os.RemoveAll(directory)
+	defer func() {
+		_ = os.RemoveAll(directory)
+	}()
+
+	config := &Config{
+		Permission:     0755,
+		Directory:      directory,
+		FlushThreshold: 1024 * 1024,
+		MaxLevel:       3,
+		SizeFactor:     10,
+		BloomFilter:    false,
+		Logging:        false,
+	}
+
+	starskey, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	txn := starskey.BeginTxn()
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key%02d", i))
+		txn.Put(key, append([]byte("value-"), key...))
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	if err := starskey.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+
+	starskey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to reopen starskey: %v", err)
+	}
+	defer func() {
+		_ = starskey.Close()
+	}()
+
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key%02d", i))
+		expected := append([]byte("value-"), key...)
+		value, err := starskey.Get(key)
+		if err != nil {
+			t.Fatalf("Failed to get key %s after reopen: %v", key, err)
+		}
+		if !reflect.DeepEqual(value, expected) {
+			t.Fatalf("Expected %s for key %s, got %s", expected, key, value)
+		}
+	}
+}
+
 func TestStarskey_Reopen(t *testing.T) {
 	_ = os.RemoveAll("test")
 	defer func() {
