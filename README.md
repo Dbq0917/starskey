@@ -11,7 +11,7 @@ Starskey is a fast embedded key-value store package for GO!  Starskey implements
 - **Simple API** with Put, Get, Delete, Range, FilterKeys, Update (for txns), PrefixSearch, LongestPrefixSearch, DeleteByRange, DeleteByFilter, DeleteByPrefix.
 - **Acid transactions** You can group multiple operations into a single atomic transaction.  If any operation fails the entire transaction is rolled back.  Only committed operations within a transaction roll back.  These transactions would be considered fully serializable.  Transactions themselves are also thread safe so you can add operations to them safety.
 - **Configurable options** You can configure many options such as max levels, memtable threshold, bloom filter,succinct range filters, logging, compression and more.
-- **WAL with recovery** Starskey uses a write ahead log to ensure durability.  Memtable is replayed if a flush did not occur prior to shut down.  On sorted runs to disk the WAL is truncated.
+- **WAL with recovery** Starskey uses a write ahead log to ensure durability.  Memtable is replayed if a flush did not occur prior to shut down. Recovery scans the WAL in batches, decodes records in parallel, and bulk-loads the memtable; an incomplete trailing record is discarded without losing earlier records. On sorted runs to disk the WAL is truncated.
 - **Key value separation** Keys and values are stored separately for sstables within a klog and vlog respectively.
 - **Bloom filters** Each sstable has an in memory bloom filter to reduce disk reads. Bloom filters are used to check if a key exists in an SST instead of scanning it entirely.
 - **Succinct Range Filters** If enabled, each sstable will use a SuRF instead of a bloom filter;  This will speed up range, prefix queries. Will use more memory than bloom filters. Only a bloom filter OR a SuRF filter can be enabled.
@@ -61,6 +61,7 @@ func main() {
         //    PageSize:                .. Page size for internal pagers
         //    BloomFilterProbability:  .. Bloom filter probability
         //    LogChannel              chan string   // Log channel, instead of log file or standard output we log to a channel
+        //    WALReplayWorkers:        .. Workers used to decode WAL records during recovery (default GOMAXPROCS)
         //    },
         }) // Config cannot be nil**
     if err != nil {

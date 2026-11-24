@@ -204,6 +204,72 @@ func TestTTree_EmptyTree(t *testing.T) {
 	}
 }
 
+func TestTTree_BulkLoadSorted(t *testing.T) {
+	tree := New(12, 32)
+	entries := []*Entry{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+		{Key: []byte("c"), Value: []byte("3")},
+		{Key: []byte("d"), Value: []byte("4")},
+		{Key: []byte("e"), Value: []byte("5")},
+	}
+
+	if err := tree.BulkLoadSorted(entries); err != nil {
+		t.Fatalf("Failed to bulk load: %v", err)
+	}
+
+	for _, expected := range entries {
+		entry, ok := tree.Get(expected.Key)
+		if !ok {
+			t.Fatalf("Expected key %s after bulk load", expected.Key)
+		}
+		if string(entry.Value) != string(expected.Value) {
+			t.Fatalf("Expected value %s for %s, got %s", expected.Value, expected.Key, entry.Value)
+		}
+	}
+
+	if count := tree.CountEntries(); count != len(entries) {
+		t.Fatalf("Expected %d entries, got %d", len(entries), count)
+	}
+
+	if err := tree.Put([]byte("c"), []byte("updated")); err != nil {
+		t.Fatalf("Failed to update after bulk load: %v", err)
+	}
+	if err := tree.Put([]byte("f"), []byte("6")); err != nil {
+		t.Fatalf("Failed to put after bulk load: %v", err)
+	}
+
+	entry, ok := tree.Get([]byte("c"))
+	if !ok || string(entry.Value) != "updated" {
+		t.Fatalf("Expected updated value for c")
+	}
+
+	rangeEntries := tree.Range([]byte("b"), []byte("e"))
+	if len(rangeEntries) != 4 {
+		t.Fatalf("Expected 4 range entries, got %d", len(rangeEntries))
+	}
+}
+
+func TestTTree_BulkLoadRejectsUnsortedOrDuplicateKeys(t *testing.T) {
+	tree := New(12, 32)
+
+	unsorted := []*Entry{
+		{Key: []byte("b"), Value: []byte("2")},
+		{Key: []byte("a"), Value: []byte("1")},
+	}
+	if err := tree.BulkLoadSorted(unsorted); err == nil {
+		t.Fatalf("Expected unsorted entries to be rejected")
+	}
+
+	duplicate := []*Entry{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("a"), Value: []byte("2")},
+	}
+	if err := tree.BulkLoadSorted(duplicate); err == nil {
+		t.Fatalf("Expected duplicate keys to be rejected")
+	}
+}
+
 func BenchmarkTTree_Put(b *testing.B) {
 	tree := New(12, 32)
 	for i := 0; i < b.N; i++ {

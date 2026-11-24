@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -725,6 +726,235 @@ func TestStarskey_Reopen(t *testing.T) {
 		t.Fatalf("Failed to close starskey: %v", err)
 	}
 
+}
+
+func TestStarskey_ReplayLastOperationWins(t *testing.T) {
+	dir := t.TempDir()
+	config := &Config{
+		Permission:     0755,
+		Directory:      dir,
+		FlushThreshold: 1 << 30,
+		MaxLevel:       3,
+		SizeFactor:     10,
+	}
+
+	skey, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	if err := skey.Put([]byte("k1"), []byte("old")); err != nil {
+		t.Fatalf("Failed to put k1: %v", err)
+	}
+	if err := skey.Put([]byte("k1"), []byte("new")); err != nil {
+		t.Fatalf("Failed to update k1: %v", err)
+	}
+	if err := skey.Put([]byte("k2"), []byte("delete-me")); err != nil {
+		t.Fatalf("Failed to put k2: %v", err)
+	}
+	if err := skey.Delete([]byte("k2")); err != nil {
+		t.Fatalf("Failed to delete k2: %v", err)
+	}
+	if err := skey.Put([]byte("k3"), []byte("three")); err != nil {
+		t.Fatalf("Failed to put k3: %v", err)
+	}
+	if err := skey.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+
+	skey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to reopen starskey: %v", err)
+	}
+	defer skey.Close()
+
+	value, err := skey.Get([]byte("k1"))
+	if err != nil {
+		t.Fatalf("Failed to get k1: %v", err)
+	}
+	if !bytes.Equal(value, []byte("new")) {
+		t.Fatalf("Expected latest k1 value, got %q", value)
+	}
+
+	value, err = skey.Get([]byte("k2"))
+	if err != nil {
+		t.Fatalf("Failed to get k2: %v", err)
+	}
+	if value != nil {
+		t.Fatalf("Expected k2 to remain deleted, got %q", value)
+	}
+
+	if err := skey.Put([]byte("k4"), []byte("four")); err != nil {
+		t.Fatalf("Failed to put after replay: %v", err)
+	}
+}
+
+func TestStarskey_ReplayDiscardsTornWALTail(t *testing.T) {
+	dir := t.TempDir()
+	config := &Config{
+		Permission:     0755,
+		Directory:      dir,
+		FlushThreshold: 1 << 30,
+		MaxLevel:       3,
+		SizeFactor:     10,
+	}
+
+	skey, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	const recordCount = 100
+	for i := 0; i < recordCount; i++ {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		value := []byte(fmt.Sprintf("value%03d", i))
+		if err := skey.Put(key, value); err != nil {
+			t.Fatalf("Failed to put %s: %v", key, err)
+		}
+	}
+	if err := skey.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+
+	walPath := filepath.Join(dir, WALExtension)
+	walInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("Failed to stat WAL: %v", err)
+	}
+	if err := os.Truncate(walPath, walInfo.Size()-1); err != nil {
+		t.Fatalf("Failed to tear WAL tail: %v", err)
+	}
+
+	skey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to recover starskey: %v", err)
+	}
+
+	recoveredInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("Failed to stat recovered WAL: %v", err)
+	}
+	if recoveredInfo.Size() >= walInfo.Size() {
+		t.Fatalf("Expected incomplete WAL tail to be discarded")
+	}
+	if recoveredInfo.Size()%(int64(PageSize)+16) != 0 {
+		t.Fatalf("WAL was not truncated to a page boundary: %d", recoveredInfo.Size())
+	}
+
+	for i := 0; i < recordCount-1; i++ {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		value, err := skey.Get(key)
+		if err != nil {
+			t.Fatalf("Failed to get %s: %v", key, err)
+		}
+		if !bytes.Equal(value, []byte(fmt.Sprintf("value%03d", i))) {
+			t.Fatalf("Recovered wrong value for %s: %q", key, value)
+		}
+	}
+
+	lastKey := []byte(fmt.Sprintf("key%03d", recordCount-1))
+	value, err := skey.Get(lastKey)
+	if err != nil {
+		t.Fatalf("Failed to get torn key: %v", err)
+	}
+	if value != nil {
+		t.Fatalf("Expected torn final record to be discarded, got %q", value)
+	}
+
+	// A new append must start at the recovered record boundary, not after the
+	// discarded bytes.
+	if err := skey.Put([]byte("after-recovery"), []byte("ok")); err != nil {
+		t.Fatalf("Failed to append after recovery: %v", err)
+	}
+	if err := skey.Close(); err != nil {
+		t.Fatalf("Failed to close recovered starskey: %v", err)
+	}
+
+	skey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to reopen recovered starskey: %v", err)
+	}
+	defer skey.Close()
+
+	value, err = skey.Get([]byte("after-recovery"))
+	if err != nil {
+		t.Fatalf("Failed to get appended key: %v", err)
+	}
+	if !bytes.Equal(value, []byte("ok")) {
+		t.Fatalf("Expected appended value after recovery, got %q", value)
+	}
+}
+
+func TestStarskey_ReplayDiscardsUndecodableFinalWALRecord(t *testing.T) {
+	dir := t.TempDir()
+	config := &Config{
+		Permission:     0755,
+		Directory:      dir,
+		FlushThreshold: 1 << 30,
+		MaxLevel:       3,
+		SizeFactor:     10,
+	}
+
+	skey, err := Open(config)
+	if err != nil {
+		t.Fatalf("Failed to open starskey: %v", err)
+	}
+
+	const recordCount = 20
+	for i := 0; i < recordCount; i++ {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		value := []byte(fmt.Sprintf("value%03d", i))
+		if err := skey.Put(key, value); err != nil {
+			t.Fatalf("Failed to put %s: %v", key, err)
+		}
+	}
+	if err := skey.Close(); err != nil {
+		t.Fatalf("Failed to close starskey: %v", err)
+	}
+
+	walPath := filepath.Join(dir, WALExtension)
+	walInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("Failed to stat WAL: %v", err)
+	}
+	lastRecordStart := walInfo.Size() - (int64(PageSize) + 16)
+
+	f, err := os.OpenFile(walPath, os.O_RDWR, 0755)
+	if err != nil {
+		t.Fatalf("Failed to open WAL for corruption: %v", err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xff}, 32), lastRecordStart+16); err != nil {
+		_ = f.Close()
+		t.Fatalf("Failed to corrupt final WAL record: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Failed to close corrupted WAL: %v", err)
+	}
+
+	skey, err = Open(config)
+	if err != nil {
+		t.Fatalf("Failed to recover starskey: %v", err)
+	}
+	defer skey.Close()
+
+	for i := 0; i < recordCount-1; i++ {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		value, err := skey.Get(key)
+		if err != nil {
+			t.Fatalf("Failed to get %s: %v", key, err)
+		}
+		if !bytes.Equal(value, []byte(fmt.Sprintf("value%03d", i))) {
+			t.Fatalf("Recovered wrong value for %s: %q", key, value)
+		}
+	}
+
+	recoveredInfo, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("Failed to stat recovered WAL: %v", err)
+	}
+	if recoveredInfo.Size() != lastRecordStart {
+		t.Fatalf("Expected WAL to end at %d, got %d", lastRecordStart, recoveredInfo.Size())
+	}
 }
 
 func TestStarskey_Put_Bloom(t *testing.T) {

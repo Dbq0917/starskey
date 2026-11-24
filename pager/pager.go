@@ -23,9 +23,11 @@ package pager
 // The iterator is able to traverse through the pages reliable skipping and gathering pages as needed.
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sync"
@@ -52,6 +54,14 @@ type Iterator struct {
 	currentPage int    // Current page number
 	CurrentData []byte // Current data
 	maxPages    int    // Max pages based on file size calculation
+}
+
+// ScannedRecord is a complete record read sequentially from a pager file.
+// Start and End are byte offsets in the file. End is exclusive.
+type ScannedRecord struct {
+	Data  []byte
+	Start int64
+	End   int64
 }
 
 // Open opens a file for paging
@@ -104,6 +114,162 @@ func (p *Pager) Truncate() error {
 		return err
 	}
 	return nil
+}
+
+// TruncateTo truncates the file to size bytes and persists the new size.
+// It is used to discard an incomplete trailing record before the file is
+// appended to again.
+func (p *Pager) TruncateTo(size int64) error {
+	if size < 0 {
+		return errors.New("size cannot be negative")
+	}
+
+	fileInfo, err := p.file.Stat()
+	if err != nil {
+		return err
+	}
+	if size > fileInfo.Size() {
+		return errors.New("size cannot be larger than the file")
+	}
+
+	if err := p.file.Truncate(size); err != nil {
+		return err
+	}
+
+	// A recovery truncation must survive a process crash before the next
+	// append. Do this even when background syncing is disabled.
+	return p.file.Sync()
+}
+
+// ScanRecordCount validates record framing and returns the number of complete
+// records. validEnd is the byte offset immediately after the last complete
+// record and can be used to truncate a torn tail.
+func (p *Pager) ScanRecordCount() (count int, validEnd int64, err error) {
+	validEnd, err = p.scan(false, func(ScannedRecord) error {
+		count++
+		return nil
+	})
+	return count, validEnd, err
+}
+
+// ReadRecordBatches reads complete records sequentially in bounded batches.
+// This keeps recovery memory usage independent of the total WAL size.
+func (p *Pager) ReadRecordBatches(batchSize int, fn func([]ScannedRecord) error) (int64, error) {
+	if batchSize <= 0 {
+		return 0, errors.New("batch size must be greater than zero")
+	}
+
+	batch := make([]ScannedRecord, 0, batchSize)
+	validEnd, err := p.scan(true, func(record ScannedRecord) error {
+		batch = append(batch, record)
+		if len(batch) < batchSize {
+			return nil
+		}
+		if err := fn(batch); err != nil {
+			return err
+		}
+		batch = make([]ScannedRecord, 0, batchSize)
+		return nil
+	})
+	if err != nil {
+		return validEnd, err
+	}
+	if len(batch) > 0 {
+		if err := fn(batch); err != nil {
+			return validEnd, err
+		}
+	}
+	return validEnd, nil
+}
+
+// ScanRecords reads the file sequentially and returns every complete record.
+// If the file ends in a partial page or a partial overflow chain, the
+// incomplete record is not returned.
+func (p *Pager) ScanRecords() ([]ScannedRecord, int64, error) {
+	var records []ScannedRecord
+	validEnd, err := p.scan(true, func(record ScannedRecord) error {
+		records = append(records, record)
+		return nil
+	})
+	return records, validEnd, err
+}
+
+func (p *Pager) scan(includeData bool, emit func(ScannedRecord) error) (validEnd int64, err error) {
+	if p == nil || p.file == nil {
+		return 0, errors.New("pager is not open")
+	}
+
+	fileInfo, err := p.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	fileSize := fileInfo.Size()
+	if fileSize == 0 {
+		return 0, nil
+	}
+
+	if _, err := p.file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	// A buffered reader avoids two small reads per page. Records are still
+	// assembled page by page because an overflow chain may span many pages.
+	reader := bufio.NewReaderSize(p.file, 1024*1024)
+	slotSize := int64(p.pageSize + 16)
+	page := make([]byte, slotSize)
+	var record []byte
+	var offset int64
+
+	for offset+slotSize <= fileSize {
+		recordStart := offset
+		record = record[:0]
+		complete := false
+
+		for offset+slotSize <= fileSize {
+			if _, err := io.ReadFull(reader, page); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					return validEnd, nil
+				}
+				return validEnd, err
+			}
+
+			dataSize := binary.LittleEndian.Uint64(page[0:8])
+			overflow := binary.LittleEndian.Uint64(page[8:16])
+			if dataSize == 0 || dataSize > uint64(p.pageSize) || overflow > 1 {
+				// WALs are append-only. Once the page framing is invalid,
+				// everything from this record onward is an incomplete tail.
+				return validEnd, nil
+			}
+
+			if includeData {
+				record = append(record, page[16:16+int(dataSize)]...)
+			}
+			offset += slotSize
+			if overflow == 0 {
+				complete = true
+				break
+			}
+		}
+
+		if !complete {
+			return validEnd, nil
+		}
+
+		scanned := ScannedRecord{
+			Start: recordStart,
+			End:   offset,
+		}
+		if includeData {
+			scanned.Data = make([]byte, len(record))
+			copy(scanned.Data, record)
+		}
+		if err := emit(scanned); err != nil {
+			return validEnd, err
+		}
+		validEnd = offset
+	}
+
+	return validEnd, nil
 }
 
 // Size returns the size of the file

@@ -63,6 +63,52 @@ func New(minItems, maxItems int) *TTree {
 	}
 }
 
+// BulkLoadSorted replaces the tree contents with a balanced tree built from
+// entries that are already sorted by key and contain no duplicate keys.
+// This turns recovery from O(n log n) pointer-chasing inserts into a single
+// linear build while preserving normal Put/Get/Range/iterator behavior.
+func (t *TTree) BulkLoadSorted(entries []*Entry) error {
+	for i, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("entry %d is nil", i)
+		}
+		if i > 0 && bytes.Compare(entries[i-1].Key, entry.Key) >= 0 {
+			return fmt.Errorf("entries must be sorted by unique keys at index %d", i)
+		}
+	}
+
+	t.root = nil
+	t.SizeOfTree = 0
+	for _, entry := range entries {
+		t.SizeOfTree += uint64(len(entry.Key) + len(entry.Value))
+	}
+
+	t.root = t.buildBalanced(entries, 0, len(entries), nil)
+	return nil
+}
+
+// buildBalanced builds a balanced tree from a sorted, unique entry slice.
+func (t *TTree) buildBalanced(entries []*Entry, start, end int, parent *Node) *Node {
+	if start >= end {
+		return nil
+	}
+
+	middle := start + (end-start)/2
+	node := &Node{
+		parent:   parent,
+		data:     []*Entry{entries[middle]},
+		minItems: t.minItems,
+		maxItems: t.maxItems,
+		height:   1,
+	}
+
+	node.left = t.buildBalanced(entries, start, middle, node)
+	node.right = t.buildBalanced(entries, middle+1, end, node)
+	node.height = max(t.getHeight(node.left), t.getHeight(node.right)) + 1
+
+	return node
+}
+
 // NewIterator creates a new iterator for the T-Tree.
 func (t *TTree) NewIterator(reverse bool) *Iterator {
 	if t.root == nil {

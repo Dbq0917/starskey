@@ -237,6 +237,119 @@ func TestPager_PageCount(t *testing.T) {
 	}
 }
 
+func TestPager_ScanRecordsDiscardsTornTail(t *testing.T) {
+	filename := t.TempDir() + "/scan.bin"
+	p, err := Open(filename, os.O_CREATE|os.O_RDWR, 0777, 8, false, 0)
+	if err != nil {
+		t.Fatalf("Error opening file: %v", err)
+	}
+
+	if _, err := p.Write([]byte("first")); err != nil {
+		t.Fatalf("Error writing first record: %v", err)
+	}
+	if _, err := p.Write([]byte("second")); err != nil {
+		t.Fatalf("Error writing second record: %v", err)
+	}
+	completeSize := p.Size()
+	if err := p.Close(); err != nil {
+		t.Fatalf("Error closing pager: %v", err)
+	}
+
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0777)
+	if err != nil {
+		t.Fatalf("Error opening file for torn append: %v", err)
+	}
+	if _, err := f.Write([]byte("torn")); err != nil {
+		t.Fatalf("Error appending torn tail: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Error closing torn append: %v", err)
+	}
+
+	p, err = Open(filename, os.O_RDWR, 0777, 8, false, 0)
+	if err != nil {
+		t.Fatalf("Error reopening file: %v", err)
+	}
+	defer p.Close()
+
+	records, validEnd, err := p.ScanRecords()
+	if err != nil {
+		t.Fatalf("Error scanning records: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("Expected 2 complete records, got %d", len(records))
+	}
+	if validEnd != completeSize {
+		t.Fatalf("Expected valid end %d, got %d", completeSize, validEnd)
+	}
+	if string(records[0].Data) != "first" || string(records[1].Data) != "second" {
+		t.Fatalf("Unexpected scanned records: %q %q", records[0].Data, records[1].Data)
+	}
+
+	count, countValidEnd, err := p.ScanRecordCount()
+	if err != nil {
+		t.Fatalf("Error counting records: %v", err)
+	}
+	if count != 2 || countValidEnd != completeSize {
+		t.Fatalf("Unexpected count result: %d records ending at %d", count, countValidEnd)
+	}
+
+	var batched []string
+	if _, err := p.ReadRecordBatches(1, func(batch []ScannedRecord) error {
+		for _, record := range batch {
+			batched = append(batched, string(record.Data))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Error reading record batches: %v", err)
+	}
+	if len(batched) != 2 || batched[0] != "first" || batched[1] != "second" {
+		t.Fatalf("Unexpected batched records: %q", batched)
+	}
+
+	if err := p.TruncateTo(validEnd); err != nil {
+		t.Fatalf("Error truncating torn tail: %v", err)
+	}
+	if p.Size() != validEnd {
+		t.Fatalf("Expected size %d after truncation, got %d", validEnd, p.Size())
+	}
+}
+
+func TestPager_ScanRecordsDiscardsIncompleteOverflowChain(t *testing.T) {
+	filename := t.TempDir() + "/overflow.bin"
+	p, err := Open(filename, os.O_CREATE|os.O_RDWR, 0777, 4, false, 0)
+	if err != nil {
+		t.Fatalf("Error opening file: %v", err)
+	}
+
+	if _, err := p.Write([]byte("abcdefghij")); err != nil {
+		t.Fatalf("Error writing overflowing record: %v", err)
+	}
+	slotSize := int64(p.GetPageSize() + 16)
+	if err := p.Close(); err != nil {
+		t.Fatalf("Error closing pager: %v", err)
+	}
+
+	// Keep two pages of a three-page record.
+	if err := os.Truncate(filename, slotSize*2); err != nil {
+		t.Fatalf("Error truncating overflow chain: %v", err)
+	}
+
+	p, err = Open(filename, os.O_RDWR, 0777, 4, false, 0)
+	if err != nil {
+		t.Fatalf("Error reopening file: %v", err)
+	}
+	defer p.Close()
+
+	records, validEnd, err := p.ScanRecords()
+	if err != nil {
+		t.Fatalf("Error scanning records: %v", err)
+	}
+	if len(records) != 0 || validEnd != 0 {
+		t.Fatalf("Expected incomplete overflow chain to be discarded, got %d records ending at %d", len(records), validEnd)
+	}
+}
+
 func BenchmarkPager_Write(b *testing.B) {
 	defer os.Remove("test.bin")
 	p, err := Open("test.bin", os.O_CREATE|os.O_RDWR, 0777, 128, true, time.Millisecond*128)

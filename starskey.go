@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +72,7 @@ type OptionalConfig struct {
 	PageSize                int           // Page size
 	BloomFilterProbability  float64       // Bloom filter probability
 	LogChannel              chan string   // Log channel, instead of log file or standard output we log to a channel
+	WALReplayWorkers        int           // Workers used to decode WAL records during recovery (default GOMAXPROCS)
 }
 
 // Config represents the configuration for starskey instance
@@ -1181,47 +1184,213 @@ func (skey *Starskey) openSSTables(directory string, bf bool, perm os.FileMode, 
 	return sstables, nil
 }
 
-// replayWal replays write ahead log and rebuilds the last memtable state
-func (skey *Starskey) replayWAL() error {
+type replayEntry struct {
+	entry *ttree.Entry
+	seq   int
+}
 
-	if skey.wal.PageCount() == 0 {
+var errIncompleteWALTail = errors.New("incomplete WAL tail record")
+
+// replayWAL rebuilds the memtable from the WAL in batches. The log is scanned
+// sequentially, decoded in parallel, reduced to the last operation per key,
+// and loaded into a balanced T-Tree in one pass.
+func (skey *Starskey) replayWAL() error {
+	walSize := skey.wal.Size()
+	recordCount, validEnd, err := skey.wal.ScanRecordCount()
+	if err != nil {
+		return err
+	}
+
+	// A crash can leave a partial page or an incomplete overflow chain at the
+	// end of the WAL. Discard exactly that tail so the next append starts at a
+	// complete record boundary. Complete records before it are always kept.
+	if validEnd < walSize {
+		if err := skey.wal.TruncateTo(validEnd); err != nil {
+			return err
+		}
+		skey.WriteLog(fmt.Sprintf("Discarded %d bytes of incomplete WAL tail", walSize-validEnd))
+	}
+
+	if recordCount == 0 {
 		skey.WriteLog("No records in WAL to replay")
 		return nil
 	}
 
-	// We create an iter for the write-ahead log
-	iter := pager.NewIterator(skey.wal)
+	const replayBatchSize = 4096
+	entries := make([]replayEntry, 0, recordCount)
+	nextSeq := 0
+	tailStart := int64(-1)
+	var callbackErr error
 
-	// We iterate over all records in the write-ahead log
-	for iter.Next() {
-		data, err := iter.Read()
-		if err != nil {
-			return err
-		}
-
-		// Deserialize the WAL record
-		record, err := deserializeWalRecord(data, skey.config.Compression, skey.config.CompressionOption)
-		if err != nil {
-			return err
-		}
-
-		// We apply the operation in the WAL record
-		switch record.Op {
-		case Put:
-			err = skey.memtable.Put(record.Key, record.Value)
-			if err != nil {
-				return err
+	_, err = skey.wal.ReadRecordBatches(replayBatchSize, func(batch []pager.ScannedRecord) error {
+		records, firstBad, decodeErr := skey.deserializeWALBatch(batch)
+		if firstBad < 0 {
+			for _, record := range records {
+				if entry, ok := replayEntryForRecord(record, nextSeq); ok {
+					entries = append(entries, entry)
+				}
+				nextSeq++
 			}
-		case Delete:
-			err = skey.memtable.Put(record.Key, Tombstone)
-			if err != nil {
-				return err
-			}
+			return nil
 		}
 
+		for i := 0; i < firstBad; i++ {
+			if entry, ok := replayEntryForRecord(records[i], nextSeq); ok {
+				entries = append(entries, entry)
+			}
+			nextSeq++
+		}
+
+		// Complete page framing does not guarantee complete serialized data.
+		// Only the final record can be a torn tail; earlier corruption is an
+		// error rather than silently dropping complete records after it.
+		if nextSeq != recordCount-1 {
+			callbackErr = fmt.Errorf("failed to deserialize WAL record %d: %w", nextSeq, decodeErr)
+			return callbackErr
+		}
+
+		tailStart = batch[firstBad].Start
+		return errIncompleteWALTail
+	})
+	if err != nil && !errors.Is(err, errIncompleteWALTail) {
+		if callbackErr != nil {
+			return callbackErr
+		}
+		return err
 	}
 
+	if tailStart >= 0 {
+		if err := skey.wal.TruncateTo(tailStart); err != nil {
+			return err
+		}
+		skey.WriteLog(fmt.Sprintf("Discarded incomplete final WAL record at offset %d", tailStart))
+	}
+	if nextSeq != recordCount && !(tailStart >= 0 && nextSeq == recordCount-1) {
+		return fmt.Errorf("WAL changed during recovery: scanned %d records, processed %d", recordCount, nextSeq)
+	}
+
+	// Keep WAL order for duplicate keys, then retain only the newest operation.
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := bytes.Compare(entries[i].entry.Key, entries[j].entry.Key)
+		if cmp == 0 {
+			return entries[i].seq < entries[j].seq
+		}
+		return cmp < 0
+	})
+
+	unique := 0
+	for read := 0; read < len(entries); {
+		next := read + 1
+		for next < len(entries) && bytes.Equal(entries[read].entry.Key, entries[next].entry.Key) {
+			next++
+		}
+		entries[unique] = entries[next-1]
+		unique++
+		read = next
+	}
+	for i := unique; i < len(entries); i++ {
+		entries[i] = replayEntry{}
+	}
+	entries = entries[:unique]
+
+	memtableEntries := make([]*ttree.Entry, len(entries))
+	for i := range entries {
+		memtableEntries[i] = entries[i].entry
+	}
+
+	if err := skey.memtable.BulkLoadSorted(memtableEntries); err != nil {
+		return err
+	}
+
+	skey.WriteLog(fmt.Sprintf("Replayed %d WAL records into %d memtable entries using %d workers", nextSeq, len(memtableEntries), skey.walReplayWorkers()))
 	return nil
+}
+
+func replayEntryForRecord(record *WALRecord, seq int) (replayEntry, bool) {
+	if record == nil {
+		return replayEntry{}, false
+	}
+
+	var value []byte
+	switch record.Op {
+	case Put:
+		value = record.Value
+	case Delete:
+		value = Tombstone
+	default:
+		return replayEntry{}, false
+	}
+
+	return replayEntry{
+		entry: &ttree.Entry{Key: record.Key, Value: value},
+		seq:   seq,
+	}, true
+}
+
+func (skey *Starskey) walReplayWorkers() int {
+	workers := runtime.GOMAXPROCS(0)
+	if skey.config.Optional != nil && skey.config.Optional.WALReplayWorkers > 0 {
+		workers = skey.config.Optional.WALReplayWorkers
+	}
+	if workers < 1 {
+		return 1
+	}
+	return workers
+}
+
+// deserializeWALBatch decodes one batch in parallel while preserving order.
+// firstBad is the first index that failed to decode, or -1 when all succeeded.
+func (skey *Starskey) deserializeWALBatch(scanned []pager.ScannedRecord) ([]*WALRecord, int, error) {
+	records := make([]*WALRecord, len(scanned))
+	if len(scanned) == 0 {
+		return records, -1, nil
+	}
+
+	workers := skey.walReplayWorkers()
+	if workers > len(scanned) {
+		workers = len(scanned)
+	}
+
+	var (
+		firstBad = -1
+		firstErr error
+		errMu    sync.Mutex
+		wg       sync.WaitGroup
+	)
+
+	chunkSize := (len(scanned) + workers - 1) / workers
+	wg.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunkSize
+		end := start + chunkSize
+		if start >= len(scanned) {
+			wg.Done()
+			continue
+		}
+		if end > len(scanned) {
+			end = len(scanned)
+		}
+
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				record, err := deserializeWalRecord(scanned[i].Data, skey.config.Compression, skey.config.CompressionOption)
+				if err != nil {
+					errMu.Lock()
+					if firstBad == -1 || i < firstBad {
+						firstBad = i
+						firstErr = err
+					}
+					errMu.Unlock()
+					continue
+				}
+				records[i] = record
+			}
+		}(start, end)
+	}
+	wg.Wait()
+
+	return records, firstBad, firstErr
 }
 
 // run runs a sorted flush to disk level 1
